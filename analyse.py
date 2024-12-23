@@ -3,16 +3,15 @@ import json
 import yaml
 import requests
 from urllib.parse import urljoin
+import os
+from pathlib import Path
+from datetime import datetime, timedelta
 
 
 def get_streaming_patterns():
     """
     Fetch streaming service regex patterns from GitHub repository or load from local cache
     """
-    import os
-    from datetime import datetime, timedelta
-    from pathlib import Path
-
     # Create data directory if it doesn't exist
     data_dir = Path('data')
     data_dir.mkdir(exist_ok=True)
@@ -29,17 +28,16 @@ def get_streaming_patterns():
             cache_time = datetime.fromisoformat(metadata['last_update'])
 
             if datetime.now() - cache_time < timedelta(hours=24):
-                print("Loading patterns from local cache")
+                print("Loading streaming patterns from local cache.")
                 with open(cache_file, 'r') as f:
                     return yaml.safe_load(f)
             else:
-                print("Cache is older than 24 hours, refreshing from GitHub")
+                print("Cache is older than 24 hours, refreshing from GitHub.")
         except Exception as e:
             print(f"Error reading cache: {str(e)}")
 
     # If we get here, we need to fetch from GitHub
     api_url = "https://api.github.com/repos/Dictionarry-Hub/database/contents/regex_patterns"
-
     try:
         print("Fetching patterns from GitHub...")
         response = requests.get(api_url)
@@ -78,7 +76,7 @@ def get_streaming_patterns():
                     continue
 
         # Save patterns to cache
-        print("Saving patterns to cache")
+        print("Saving streaming patterns to cache.")
         with open(cache_file, 'w') as f:
             yaml.dump(patterns, f)
 
@@ -87,7 +85,7 @@ def get_streaming_patterns():
             yaml.dump({'last_update': datetime.now().isoformat()}, f)
 
         print(
-            f"Successfully cached {len(patterns)} streaming service patterns")
+            f"Successfully cached {len(patterns)} streaming service patterns.")
         return patterns
 
     except Exception as e:
@@ -95,7 +93,7 @@ def get_streaming_patterns():
 
         # If we have a cache file, try to use it as fallback
         if cache_file.exists():
-            print("Falling back to existing cache due to error")
+            print("Falling back to existing cache due to error.")
             try:
                 with open(cache_file, 'r') as f:
                     return yaml.safe_load(f)
@@ -105,37 +103,19 @@ def get_streaming_patterns():
         return {}
 
 
-def analyze_releases(entries):
-    # First pass - get average remux size
+def get_remux_average_size(entries):
+    """
+    Returns the average size (in GB) of REMUX 1080p files (excluding extras).
+    """
     remux_sizes = []
-    release_data = {}
-    streaming_data = {}
 
     pattern_1080p = re.compile(r'1080p', re.IGNORECASE)
     pattern_remux = re.compile(r'remux', re.IGNORECASE)
     pattern_extras = re.compile(r'extras', re.IGNORECASE)
-    pattern_webdl = re.compile(r'web-?dl', re.IGNORECASE)
-    pattern_h265 = re.compile(r'(?i)h\s*\.?\s*265')
 
-    # Get streaming service patterns
-    streaming_patterns = get_streaming_patterns()
-    compiled_patterns = {
-        name: re.compile(pattern, re.IGNORECASE)
-        for name, pattern in streaming_patterns.items()
-    }
-
-    # First pass for remux sizes
     for entry in entries:
         title = entry.get('title', '')
         size = entry.get('size', 0)
-
-        # Check quality source
-        quality_info = entry.get('quality', {}).get('quality', {})
-        source = quality_info.get('source', '').lower()
-
-        pattern_1080p = re.compile(r'1080p', re.IGNORECASE)
-        pattern_remux = re.compile(r'remux', re.IGNORECASE)
-        pattern_extras = re.compile(r'extras', re.IGNORECASE)
 
         has_1080p = bool(pattern_1080p.search(title))
         has_remux = bool(pattern_remux.search(title))
@@ -146,13 +126,26 @@ def analyze_releases(entries):
             remux_sizes.append(size_gb)
 
     if not remux_sizes:
-        print("No remux files found for comparison")
-        return
+        return None  # or 0, or raise an exception
 
-    average_remux_size = sum(remux_sizes) / len(remux_sizes)
-    print(f"Average remux size: {average_remux_size:.2f} GB")
+    return sum(remux_sizes) / len(remux_sizes)
 
-    # Second pass - analyze non-remux releases
+
+def parse_release_groups(entries, average_remux_size):
+    """
+    Parse non-remux 1080p releases (excluding extras and webdl).
+    Calculates relative efficiency and groups by release group.
+    Returns a dictionary of results for release groups.
+    """
+    if average_remux_size is None:
+        return {}  # can't parse if no average
+
+    release_data = {}
+
+    pattern_1080p = re.compile(r'1080p', re.IGNORECASE)
+    pattern_remux = re.compile(r'remux', re.IGNORECASE)
+    pattern_extras = re.compile(r'extras', re.IGNORECASE)
+
     for entry in entries:
         title = entry.get('title', '')
         size = entry.get('size', 0)
@@ -171,12 +164,10 @@ def analyze_releases(entries):
             size_gb = size / (1024 * 1024 * 1024)
             efficiency = (size_gb / average_remux_size) * 100
 
-            # Store release information
             if release_group not in release_data:
                 release_data[release_group] = {
                     'releases': [],
-                    'efficiencies': [],
-                    'average_efficiency': 0
+                    'efficiencies': []
                 }
 
             release_data[release_group]['releases'].append({
@@ -189,8 +180,33 @@ def analyze_releases(entries):
             })
             release_data[release_group]['efficiencies'].append(efficiency)
 
+    return release_data
+
+
+def parse_streaming_services(entries, average_remux_size, streaming_patterns):
+    """
+    Parse 1080p WEB-DL releases, match against known streaming services,
+    and calculate relative efficiency.
+    Returns a dictionary of streaming service data.
+    """
+    if average_remux_size is None:
+        return {}
+
+    streaming_data = {}
+
+    # Pre-compile patterns
+    pattern_1080p = re.compile(r'1080p', re.IGNORECASE)
+    pattern_webdl = re.compile(r'web-?dl', re.IGNORECASE)
+    pattern_extras = re.compile(r'extras', re.IGNORECASE)
+    pattern_h265 = re.compile(r'(?i)h\s*\.?\s*265')
     x265_pattern = re.compile(
         r'^(?!.*(?i:remux))(?=.*(\b[x]\s?(\.?265)\b|HEVC|\bDS4K\b)).*$')
+
+    # Compile streaming service patterns
+    compiled_patterns = {
+        name: re.compile(pattern, re.IGNORECASE)
+        for name, pattern in streaming_patterns.items()
+    }
 
     for entry in entries:
         title = entry.get('title', '')
@@ -211,8 +227,8 @@ def analyze_releases(entries):
 
             # Check for streaming service patterns
             detected_service = None
-            for service_name, pattern in compiled_patterns.items():
-                if pattern.search(title):
+            for service_name, service_pattern in compiled_patterns.items():
+                if service_pattern.search(title):
                     # Add codec suffix to service name
                     service_key = f"{service_name} (H.265)" if is_h265 else f"{service_name} (H.264)"
                     detected_service = service_key
@@ -222,8 +238,7 @@ def analyze_releases(entries):
                 if detected_service not in streaming_data:
                     streaming_data[detected_service] = {
                         'releases': [],
-                        'efficiencies': [],
-                        'average_efficiency': 0
+                        'efficiencies': []
                     }
 
                 streaming_data[detected_service]['releases'].append({
@@ -237,21 +252,52 @@ def analyze_releases(entries):
                 streaming_data[detected_service]['efficiencies'].append(
                     efficiency)
 
-    # Calculate averages and prepare output data
+    return streaming_data
+
+
+def analyze_releases(entries):
+    """
+    Main function to orchestrate analysis:
+    - Fetch streaming patterns
+    - Get average remux size
+    - Parse release groups (non-remux encodes)
+    - Parse streaming services (WEB-DL)
+    - Combine and save to a dict
+    """
+    # Get streaming service patterns
+    streaming_patterns = get_streaming_patterns()
+
+    # 1) Get average REMUX size
+    average_remux_size = get_remux_average_size(entries)
+    if average_remux_size is None:
+        print(
+            "No valid REMUX entries found. Cannot compute average. Returning.")
+        return {'average_remux_size_gb': 0, 'source': {}}
+
+    print(f"Average REMUX size: {average_remux_size:.2f} GB")
+
+    # 2) Parse release groups
+    release_data = parse_release_groups(entries, average_remux_size)
+
+    # 3) Parse streaming services
+    streaming_data = parse_streaming_services(entries, average_remux_size,
+                                              streaming_patterns)
+
+    # Combine results
     output_data = {
         'average_remux_size_gb': round(average_remux_size, 2),
-        'source': {}  # Single dictionary for all sources
+        'source': {}
     }
 
-    # Process and combine both release groups and streaming services
+    # Merge both dictionaries (release_data, streaming_data) into one "source" dict
     all_sources = {}
 
     # Add release groups
     for group, data in release_data.items():
         efficiencies = data['efficiencies']
-        avg_efficiency = sum(efficiencies) / len(efficiencies)
+        avg_eff = sum(efficiencies) / len(efficiencies) if efficiencies else 0
         all_sources[group] = {
-            'average_efficiency_percent': round(avg_efficiency, 1),
+            'average_efficiency_percent': round(avg_eff, 1),
             'number_of_releases': len(data['releases']),
             'releases': sorted(data['releases'], key=lambda x: x['efficiency'])
         }
@@ -259,39 +305,73 @@ def analyze_releases(entries):
     # Add streaming services
     for service, data in streaming_data.items():
         efficiencies = data['efficiencies']
-        avg_efficiency = sum(efficiencies) / len(efficiencies)
+        avg_eff = sum(efficiencies) / len(efficiencies) if efficiencies else 0
         all_sources[service] = {
-            'average_efficiency_percent': round(avg_efficiency, 1),
+            'average_efficiency_percent': round(avg_eff, 1),
             'number_of_releases': len(data['releases']),
             'releases': sorted(data['releases'], key=lambda x: x['efficiency'])
         }
 
-    # Sort all sources by average efficiency
+    # Sort combined sources by average efficiency
     sorted_sources = sorted(all_sources.items(),
                             key=lambda x: x[1]['average_efficiency_percent'])
 
-    # Add to output data
     for source, data in sorted_sources:
         output_data['source'][source] = data
 
-    # Save to YAML file
-    with open('release_analysis.yml', 'w') as file:
-        yaml.dump(output_data, file, sort_keys=False, default_flow_style=False)
+    return output_data
 
 
-# Read the JSON file
-if __name__ == "__main__":
-    try:
-        with open('Barbie.json', 'r') as file:
-            data = json.load(file)
+def main():
+    """
+    Main execution:
+    - Iterate all .json files in `./input`
+    - For each, load the JSON data, analyze, and save as .yml in `./output`
+    """
+    input_dir = Path('input')
+    output_dir = Path('output')
 
+    # Ensure output directory exists
+    output_dir.mkdir(exist_ok=True)
+
+    # Gather all .json files in the input directory
+    json_files = list(input_dir.glob("*.json"))
+    if not json_files:
+        print("No JSON files found in the 'input' directory.")
+        return
+
+    for json_file in json_files:
+        print(f"\nProcessing file: {json_file.name}")
+        try:
+            with open(json_file, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+        except FileNotFoundError:
+            print(f"Error: File {json_file.name} not found.")
+            continue
+        except json.JSONDecodeError:
+            print(f"Error: Invalid JSON format in file {json_file.name}.")
+            continue
+
+        # Ensure data is a list
         if isinstance(data, dict):
             data = [data]
 
-        analyze_releases(data)
-        print("\nAnalysis has been saved to release_analysis.yml")
+        # Analyze releases
+        result = analyze_releases(data)
 
-    except FileNotFoundError:
-        print("Error: JSON file not found")
-    except json.JSONDecodeError:
-        print("Error: Invalid JSON format")
+        # Create output filename
+        output_filename = json_file.stem + '.yml'
+        output_path = output_dir / output_filename
+
+        # Save analysis to .yml
+        with open(output_path, 'w', encoding='utf-8') as out_file:
+            yaml.dump(result,
+                      out_file,
+                      sort_keys=False,
+                      default_flow_style=False)
+
+        print(f"Analysis has been saved to {output_path}")
+
+
+if __name__ == "__main__":
+    main()
