@@ -5,3 +5,6 @@
 
 # Ignore all JSON files
 *.json
+
+# Ignore shell script
+get.sh
