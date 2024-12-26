@@ -52,13 +52,21 @@ def main():
         choices=["h264", "h265", "av1"],
         default=None,
     )
-    # NEW ARGUMENT: -H / --hdr
     parser.add_argument(
         "-H",
         "--hdr",
         help=
         "Include HDR releases (Dolby Vision, HDR10, HDR10+). If not specified, only SDR releases are included.",
         action="store_true",
+    )
+    parser.add_argument(
+        "-R",
+        "--rank",
+        help=
+        "Sort results by: efficiency (e), releases (r), or alphabetical (a)",
+        type=str,
+        choices=["e", "r", "a"],
+        default="e",
     )
     args = parser.parse_args()
 
@@ -187,7 +195,7 @@ def main():
                         if unknown_leftover_releases:
                             source_data_dict[s_name]["efficiencies"].append(
                                 eff_value)
-                            # Detect codec and HDR for leftover releases
+                            # Detect codec for leftover releases
                             for rel in unknown_leftover_releases:
                                 title = rel.get("title", "")
                                 rel_codec = detect_codec(title)
@@ -271,9 +279,6 @@ def main():
                         for (s_name, avg_eff, r_count) in ranking_list
                         if r_count >= args.lower]
 
-    # Sort in descending order by average efficiency
-    ranking_list.sort(key=lambda x: x[1], reverse=True)
-
     # If a range filter is given, apply it
     if args.range:
         try:
@@ -284,6 +289,16 @@ def main():
         ranking_list = [(s_name, eff, r_count)
                         for (s_name, eff, r_count) in ranking_list
                         if lower_val <= eff <= upper_val]
+
+    # Sort based on ranking parameter
+    if args.rank == "e":
+        ranking_list.sort(key=lambda x: x[1],
+                          reverse=True)  # Sort by efficiency
+    elif args.rank == "r":
+        ranking_list.sort(key=lambda x: x[2],
+                          reverse=True)  # Sort by release count
+    else:  # "a" for alphabetical
+        ranking_list.sort(key=lambda x: x[0].lower())  # Sort by name
 
     # Build the output filename based on provided flags
     filename_parts = ["ranking"]
