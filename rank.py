@@ -60,8 +60,8 @@ def main():
         action="store_true",
     )
     parser.add_argument(
-        "-R",
-        "--rank",
+        "-O",
+        "--order",
         help=
         "Sort results by: efficiency (e), releases (r), or alphabetical (a)",
         type=str,
@@ -205,7 +205,7 @@ def main():
                             source_data_dict[s_name]["releases"].extend(
                                 unknown_leftover_releases)
 
-    # If -s/--source is used, display info and exit
+    # If -S/--source is used, display info and exit
     if args.source:
         s_name = args.source
         if s_name not in source_data_dict:
@@ -290,11 +290,11 @@ def main():
                         for (s_name, eff, r_count) in ranking_list
                         if lower_val <= eff <= upper_val]
 
-    # Sort based on ranking parameter
-    if args.rank == "e":
+    # Sort based on order parameter
+    if args.order == "e":
         ranking_list.sort(key=lambda x: x[1],
                           reverse=True)  # Sort by efficiency
-    elif args.rank == "r":
+    elif args.order == "r":
         ranking_list.sort(key=lambda x: x[2],
                           reverse=True)  # Sort by release count
     else:  # "a" for alphabetical
@@ -310,7 +310,12 @@ def main():
         filename_parts.append(f"C_{args.codec}")
     if args.hdr:
         filename_parts.append("HDR")
+    if args.order != "e":  # Only add if not using default efficiency sort
+        filename_parts.append(f"O_{args.order}")
     output_filename = "_".join(filename_parts) + ".yml"
+
+    # Print filename being written
+    print(f"\nSaving results to: {output_filename}")
 
     # Write final ranking to YAML
     ranking_dict = {
