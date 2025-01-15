@@ -7,6 +7,17 @@ from pathlib import Path
 remux_pattern = re.compile(r'remux', re.IGNORECASE)
 uhd_pattern = re.compile(r'2160p', re.IGNORECASE)
 
+# Release group mapping dictionary - keys should be lowercase
+GROUP_MAPPINGS = {'beyondhd': 'W4NK3R', 'b0mbardiers': 'b0mbardiers'}
+
+
+def normalize_group_name(name):
+    """Normalize group name for case-insensitive matching"""
+    if not name:
+        return name
+    normalized = name.lower()
+    return GROUP_MAPPINGS.get(normalized, name)
+
 
 def analyze_releases(input_data):
     """
@@ -42,7 +53,7 @@ def analyze_releases(input_data):
 
             if release['quality'].get('quality',
                                       {}).get('name') == "Bluray-2160p":
-                group_name = release['releaseGroup']
+                group_name = normalize_group_name(release['releaseGroup'])
                 if not group_name:
                     continue
 
