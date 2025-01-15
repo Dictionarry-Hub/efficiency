@@ -131,17 +131,43 @@ def analyze_results(results):
     return {"group_analysis": analysis, "overall_stats": overall_stats}
 
 
+def calculate_k(total_groups):
+    """
+    Calculate number of tiers based on total groups:
+    - Minimum 3 tiers (Top tier, Mid tier, Bottom tier)
+    - Maximum 6 tiers (More would be confusing for users)
+    - Scales based on number of groups:
+      < 15 groups: 3 tiers
+      15-30 groups: 4 tiers
+      31-50 groups: 5 tiers
+      > 50 groups: 6 tiers
+    """
+    if total_groups < 15:
+        return 3
+    elif total_groups < 30:
+        return 4
+    elif total_groups < 50:
+        return 5
+    else:
+        return 6
+
+
+def get_k_explanation(total_groups):
+    """Helper function to explain k calculation"""
+    if total_groups < 15:
+        return f"<15 groups → 3 tiers"
+    elif total_groups < 30:
+        return f"15-30 groups → 4 tiers"
+    elif total_groups < 50:
+        return f"31-50 groups → 5 tiers"
+    else:
+        return f">50 groups → 6 tiers"
+
+
 def analyze_tiers(results, target_efficiency=0.60):
     """
     Analyze release groups and assign them to tiers based on their delta from target efficiency.
-    Uses k-means clustering to determine tiers.
-    
-    Args:
-        results: List of dictionaries containing release group data
-        target_efficiency: Target compression ratio (default 0.60 or 60%)
-        
-    Returns:
-        Dictionary containing tiered results and statistics
+    Uses k-means clustering with special rules for Tier 1.
     """
     from sklearn.cluster import KMeans
     import numpy as np
@@ -150,42 +176,54 @@ def analyze_tiers(results, target_efficiency=0.60):
     groups_data = []
     for group in results:
         efficiency = group["average_compression_ratio"]
-        delta = abs(efficiency - target_efficiency)
+        delta = efficiency - target_efficiency  # Keep signed delta for Tier 1 check
+        abs_delta = abs(delta)  # Use absolute delta for clustering
 
         groups_data.append({
             "name": group["name"],
             "efficiency": efficiency,
             "delta": delta,
+            "abs_delta": abs_delta,
             "releases": len(group["releases"])
         })
 
-    # Prepare data for k-means
-    deltas = np.array([g["delta"] for g in groups_data]).reshape(-1, 1)
+    # Calculate k based on total number of groups
+    total_groups = len(groups_data)
+    k = calculate_k(total_groups)
 
-    # Calculate number of tiers (k)
-    k = max(2, len(groups_data) // 10)  # At least 2 tiers
+    # Prepare data for k-means
+    deltas = np.array([g["abs_delta"] for g in groups_data]).reshape(-1, 1)
 
     # Perform k-means clustering
     kmeans = KMeans(n_clusters=k, random_state=42)
     clusters = kmeans.fit_predict(deltas)
 
     # Sort clusters by centroids
-    # Lower delta = better tier
     centroid_order = np.argsort(kmeans.cluster_centers_.flatten())
     tier_mapping = {
         cluster: tier + 1
         for tier, cluster in enumerate(centroid_order)
     }
 
-    # Assign tiers and format results
+    # Assign tiers with Tier 1 restrictions
     tiered_results = []
     for group, cluster in zip(groups_data, clusters):
+        # Default tier from k-means
+        assigned_tier = tier_mapping[cluster]
+
+        # Apply Tier 1 restrictions:
+        # If it was assigned Tier 1 but doesn't meet criteria, bump to Tier 2
+        if assigned_tier == 1:
+            if group["delta"] < 0 and abs(
+                    group["delta"]) > 0.05:  # More than 5% below target
+                assigned_tier = 2
+
         tiered_results.append({
-            "tier": tier_mapping[cluster],
+            "tier": assigned_tier,
             "name": group["name"],
-            "efficiency": round(group["efficiency"] * 100,
-                                2),  # Convert to percentage
-            "delta": round(group["delta"] * 100, 2),  # Convert to percentage
+            "efficiency": round(group["efficiency"] * 100, 2),
+            "delta": round(abs(group["delta"]) * 100,
+                           2),  # Convert back to absolute delta for display
             "releases": group["releases"]
         })
 
@@ -217,11 +255,28 @@ def analyze_tiers(results, target_efficiency=0.60):
         tier_stats[tier]["avg_delta"] = round(
             tier_stats[tier]["avg_delta"] / groups, 2)
 
+    # Add clustering metrics
+    clustering_info = {
+        "k":
+        k,
+        "inertia":
+        kmeans.inertia_,
+        "cluster_centers":
+        [float(c) for c in sorted(kmeans.cluster_centers_.flatten())],
+        "tier1_restrictions": {
+            "min_delta": -5,  # Cannot be more than 5% below target
+            "max_delta": 5  # Can be up to 5% above target
+        }
+    }
+
     return {
         "tiered_groups": tiered_results,
         "tier_stats": tier_stats,
         "total_tiers": k,
-        "target_efficiency": target_efficiency
+        "total_groups": total_groups,
+        "target_efficiency": target_efficiency,
+        "clustering_method": "k-means",
+        "clustering_info": clustering_info
     }
 
 
@@ -234,6 +289,7 @@ def main():
     all_releases = []
     movies_processed = 0
     movies_with_2160p = 0
+    movies_without_2160p = []  # List to track movies without 4K
 
     # Read all JSON files in input directory
     for file in input_path.glob('*.json'):
@@ -253,6 +309,9 @@ def main():
 
                 if has_2160p:
                     movies_with_2160p += 1
+                else:
+                    movies_without_2160p.append(
+                        file.stem)  # Just use filename without extension
 
             except json.JSONDecodeError:
                 print(f"Error reading {file}")
@@ -262,6 +321,11 @@ def main():
     print(f"Movies Processed: {movies_processed}")
     print(f"Movies with 2160p: {movies_with_2160p}")
     print(f"Movies without 2160p: {movies_processed - movies_with_2160p}")
+
+    if movies_without_2160p:
+        print("\nMovies missing 4K releases:")
+        for movie in sorted(movies_without_2160p):
+            print(f"  - {movie}")
 
     # Analyze all releases
     results = analyze_releases(all_releases)
@@ -281,7 +345,8 @@ def main():
             "total_movies_processed": movies_processed,
             "movies_with_2160p": movies_with_2160p,
             "target_efficiency": tiering["target_efficiency"],
-            "total_tiers": tiering["total_tiers"]
+            "total_tiers": tiering["total_tiers"],
+            "clustering_method": tiering["clustering_method"]
         },
         "tier_statistics": tiering["tier_stats"],
         "tiered_groups": tiering["tiered_groups"]
@@ -306,9 +371,12 @@ def main():
     print("\n" + "=" * 80)
     print(f"{'TIERED RANKINGS':^80}")
     print(f"{'Target: 60% efficiency':^80}")
+    print(
+        f"{'Groups: ' + str(tiering['total_groups']) + ' | K-means Tiers: ' + str(tiering['total_tiers']) + ' (' + get_k_explanation(tiering['total_groups']) + ')':^80}"
+    )
     print("=" * 80)
 
-    # First, get all unique tiers and sort them
+    # Get all unique tiers and sort them
     unique_tiers = sorted(
         set(group['tier'] for group in tiering['tiered_groups']))
 
