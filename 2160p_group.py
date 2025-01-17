@@ -1,3 +1,4 @@
+import argparse
 import re
 import json
 import statistics
@@ -5,6 +6,19 @@ import math
 import numpy as np
 from pathlib import Path
 from statistics import mean
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description=
+        'Analyze release group efficiency and generate tier rankings.')
+    parser.add_argument('--target',
+                        type=float,
+                        default=0.55,
+                        help='Target efficiency ratio (default: 0.55)')
+    return parser.parse_args()
+
 
 # Define regex patterns globally since they're used in multiple functions
 remux_pattern = re.compile(r'remux', re.IGNORECASE)
@@ -18,6 +32,9 @@ GROUP_MAPPINGS = {
     '10bit-hds': "HDS"
 }
 
+# Blacklisted groups
+BLACKLISTED_GROUPS = {'HONE', 'BHDStudio', 'hallowed'}
+
 
 def normalize_group_name(name):
     """Normalize group name for case-insensitive matching"""
@@ -28,9 +45,7 @@ def normalize_group_name(name):
 
 
 def analyze_releases(input_data):
-    """
-    Analyzes movie release data to generate statistics about release groups.
-    """
+    """Analyzes movie release data to generate statistics about release groups."""
     # Dictionary to store release group data
     release_groups = {}
 
@@ -62,11 +77,15 @@ def analyze_releases(input_data):
             if release['quality'].get('quality',
                                       {}).get('name') == "Bluray-2160p":
                 group_name = normalize_group_name(release['releaseGroup'])
-                if not group_name:
+                if not group_name or group_name in BLACKLISTED_GROUPS:  # Check blacklist here
                     continue
 
                 size_gb = release['size'] / (1024**3)
                 compression_ratio = size_gb / avg_remux_size
+
+                # Skip releases with extreme compression ratios
+                if compression_ratio < 0.10 or compression_ratio > 0.90:
+                    continue
 
                 if group_name not in release_groups:
                     release_groups[group_name] = {
@@ -94,16 +113,19 @@ def analyze_releases(input_data):
     output = []
     for group_data in release_groups.values():
         if group_data["releases"]:
-            output.append({
-                "name":
-                group_data["name"],
-                "average_size_gb":
-                round(mean(group_data["sizes"]), 1),
-                "average_compression_ratio":
-                round(mean(group_data["ratios"]), 2),
-                "releases":
-                group_data["releases"]
-            })
+            avg_ratio = mean(group_data["ratios"])
+            # Double-check the average ratio is within bounds
+            if 0.10 <= avg_ratio <= 0.90:
+                output.append({
+                    "name":
+                    group_data["name"],
+                    "average_size_gb":
+                    round(mean(group_data["sizes"]), 1),
+                    "average_compression_ratio":
+                    round(avg_ratio, 2),
+                    "releases":
+                    group_data["releases"]
+                })
 
     return output
 
@@ -169,118 +191,204 @@ def get_k_explanation(total_groups):
 
 
 def calculate_group_score(group_data, target_efficiency=0.55):
-    """
-    Calculate a comprehensive score for a release group based on:
-    - Proximity to target efficiency (primary factor)
-    - Release consistency/jitter (secondary factor)
-    - Number of releases (minor factor, capped at 5)
-    """
+    """Scoring system with strict volume requirements AND efficiency thresholds"""
     efficiency = group_data["average_compression_ratio"]
     releases = len(group_data["releases"])
     ratios = [r["compression_ratio"] for r in group_data["releases"]]
 
-    # Calculate efficiency score (0-100)
+    # Calculate efficiency delta
     efficiency_delta = abs(efficiency - target_efficiency)
-    base_score = max(0, 100 - (efficiency_delta * 100))
+    delta_percent = efficiency_delta * 100
 
-    # Calculate jitter penalty if multiple releases
-    if len(ratios) > 1:
-        ratio_range = max(ratios) - min(ratios)
-        # More reasonable jitter penalty (10 points per 10% spread)
-        jitter_penalty = (ratio_range * 100) / 10
+    # First apply hard efficiency-based tier restrictions
+    if delta_percent > 12:  # More than 12% off target
+        max_possible_score = 45  # Cannot reach above Tier 4
+    elif delta_percent > 8:  # More than 8% off target
+        max_possible_score = 65  # Cannot reach above Tier 3
+    elif delta_percent > 5:  # More than 5% off target
+        max_possible_score = 75  # Cannot reach above Tier 2
     else:
-        jitter_penalty = 0
+        max_possible_score = 100
 
-    # Small volume bonus (capped at 5 releases)
-    volume_bonus = min(releases,
-                       5) * 2  # +2 points per release up to 5 releases
+    # Then apply volume-based restrictions (take the more restrictive of the two)
+    if releases < 5:
+        max_possible_score = min(max_possible_score,
+                                 65)  # Cannot reach above Tier 3
+    elif releases < 10:
+        max_possible_score = min(max_possible_score,
+                                 75)  # Cannot reach above Tier 2
+    elif releases < 15:
+        max_possible_score = min(max_possible_score,
+                                 85)  # Must be Tier 2 or lower
 
-    # Calculate final score
-    final_score = base_score + volume_bonus - jitter_penalty
+    # Base efficiency score (0-70 points)
+    base_score = 70 * math.exp(-3.0 * efficiency_delta)
 
-    # Ensure score stays within 0-100 range
+    # Volume bonus (0-20 points)
+    volume_bonus = min(20, 4 * math.log2(releases + 1))
+
+    # Consistency bonus (0-10 points)
+    if len(ratios) > 1:
+        std_dev = statistics.stdev(ratios)
+        consistency_bonus = 10 * math.exp(-3 * std_dev)
+    else:
+        consistency_bonus = 0
+
+    # Heavy penalties for small sample sizes
+    if releases < 5:
+        confidence_penalty = 25 - (4 * releases)
+    elif releases < 10:
+        confidence_penalty = 10
+    else:
+        confidence_penalty = 0
+
+    # Additional efficiency penalty for severe deviations
+    if delta_percent > 12:
+        efficiency_penalty = 20
+    elif delta_percent > 8:
+        efficiency_penalty = 15
+    elif delta_percent > 5:
+        efficiency_penalty = 10
+    else:
+        efficiency_penalty = 0
+
+    # Calculate preliminary score
+    preliminary_score = (base_score + volume_bonus + consistency_bonus -
+                         confidence_penalty - efficiency_penalty)
+
+    # Apply hard cap
+    final_score = min(preliminary_score, max_possible_score)
+
     return round(max(0, min(100, final_score)), 2)
 
 
-def analyze_tiers_enhanced(results, target_efficiency=0.60):
-    """
-    Enhanced version of tier analysis using the new scoring system
-    """
-    # Calculate scores for all groups
+def calculate_tier_thresholds(scores, num_tiers):
+    """Calculate tier thresholds with strict efficiency and volume minimums"""
+    if not scores:
+        return []
+
+    # Define minimum scores required for each tier
+    min_tier_scores = {
+        1: 85,  # Tier 1: Excellent efficiency (<5% delta) and 15+ releases
+        2: 75,  # Tier 2: Good efficiency (<8% delta) and 10+ releases
+        3: 65,  # Tier 3: Decent efficiency (<12% delta) and 5+ releases
+        4: 55,  # Tier 4: Everything else
+    }
+
+    sorted_scores = sorted(scores, reverse=True)
+    thresholds = []
+
+    for tier in range(1, num_tiers):
+        if tier in min_tier_scores:
+            threshold = max(
+                min_tier_scores[tier],
+                np.percentile(sorted_scores, 100 - (tier * (100 / num_tiers))))
+        else:
+            threshold = np.percentile(sorted_scores,
+                                      100 - (tier * (100 / num_tiers)))
+        thresholds.append(threshold)
+
+    return thresholds
+
+
+def analyze_tiers_enhanced(results, target_efficiency=0.55):
+    """Enhanced tiering analysis with strict volume and efficiency requirements"""
+    # Calculate scores and collect group data
     groups_data = []
     for group in results:
+        releases = len(group["releases"])
+        efficiency = group["average_compression_ratio"]
+        efficiency_delta = abs(
+            efficiency - target_efficiency) * 100  # Convert to percentage
+
+        # Determine tier cap based on BOTH volume and efficiency
+        if efficiency_delta > 12 or releases < 5:
+            tier_cap = 4  # Must be Tier 4 or lower
+        elif efficiency_delta > 8 or releases < 10:
+            tier_cap = 3  # Must be Tier 3 or lower
+        elif efficiency_delta > 5 or releases < 15:
+            tier_cap = 2  # Must be Tier 2 or lower
+        else:
+            tier_cap = 1  # Can be any tier
+
         score = calculate_group_score(group, target_efficiency)
 
+        ratios = [r["compression_ratio"] for r in group["releases"]]
+        std_dev = statistics.stdev(ratios) if len(ratios) > 1 else 0
+
         groups_data.append({
-            "name":
-            group["name"],
-            "efficiency":
-            round(group["average_compression_ratio"] * 100, 2),
-            "releases":
-            len(group["releases"]),
-            "score":
-            score,
-            "raw_data":
-            group
+            "name": group["name"],
+            "score": score,
+            "efficiency": round(efficiency * 100, 2),
+            "efficiency_delta": efficiency_delta,
+            "releases": releases,
+            "std_dev": round(std_dev, 3),
+            "tier_cap": tier_cap,
+            "raw_data": group
         })
 
     # Sort groups by score
     groups_data.sort(key=lambda x: x["score"], reverse=True)
 
-    # Calculate tier boundaries based on scores
+    # Calculate optimal number of tiers
     total_groups = len(groups_data)
     k = calculate_k(total_groups)
 
-    # Use score percentiles to determine tier boundaries
+    # Calculate tier thresholds
     scores = [g["score"] for g in groups_data]
-    tier_boundaries = []
-    for i in range(1, k):
-        percentile = 100 - (i * (100 / k))
-        boundary = np.percentile(scores, percentile)
-        tier_boundaries.append(boundary)
+    tier_boundaries = calculate_tier_thresholds(scores, k)
 
-    # Assign tiers based on boundaries
+    # Assign tiers with volume and efficiency restrictions
     tiered_results = []
+    tier_stats = {}
+
     for group in groups_data:
-        # Determine tier based on score
+        # Determine initial tier based on score
         tier = k
         for i, boundary in enumerate(tier_boundaries):
             if group["score"] >= boundary:
                 tier = i + 1
                 break
 
-        tiered_results.append({
+        # Apply tier cap based on both volume and efficiency
+        tier = max(tier, group["tier_cap"])
+
+        group_result = {
             "tier": tier,
             "name": group["name"],
+            "score": group["score"],
             "efficiency": group["efficiency"],
             "releases": group["releases"],
-            "score": group["score"]
-        })
+            "std_dev": group["std_dev"],
+            "efficiency_delta": group["efficiency_delta"]
+        }
 
-    # Calculate tier statistics
-    tier_stats = {}
-    for group in tiered_results:
-        tier = group["tier"]
+        tiered_results.append(group_result)
+
+        # Update tier statistics
         if tier not in tier_stats:
             tier_stats[tier] = {
                 "groups": 0,
                 "total_releases": 0,
                 "avg_score": 0,
-                "avg_efficiency": 0
+                "avg_efficiency": 0,
+                "avg_std_dev": 0
             }
 
-        tier_stats[tier]["groups"] += 1
-        tier_stats[tier]["total_releases"] += group["releases"]
-        tier_stats[tier]["avg_score"] += group["score"]
-        tier_stats[tier]["avg_efficiency"] += group["efficiency"]
+        stats = tier_stats[tier]
+        stats["groups"] += 1
+        stats["total_releases"] += group["releases"]
+        stats["avg_score"] += group["score"]
+        stats["avg_efficiency"] += group["efficiency"]
+        stats["avg_std_dev"] += group["std_dev"]
 
-    # Calculate averages
+    # Calculate tier averages
     for tier in tier_stats:
         groups = tier_stats[tier]["groups"]
-        tier_stats[tier]["avg_score"] = round(
-            tier_stats[tier]["avg_score"] / groups, 2)
-        tier_stats[tier]["avg_efficiency"] = round(
-            tier_stats[tier]["avg_efficiency"] / groups, 2)
+        stats = tier_stats[tier]
+        stats["avg_score"] = round(stats["avg_score"] / groups, 2)
+        stats["avg_efficiency"] = round(stats["avg_efficiency"] / groups, 2)
+        stats["avg_std_dev"] = round(stats["avg_std_dev"] / groups, 3)
 
     return {
         "tiered_groups": tiered_results,
@@ -288,22 +396,21 @@ def analyze_tiers_enhanced(results, target_efficiency=0.60):
         "total_tiers": k,
         "total_groups": total_groups,
         "target_efficiency": target_efficiency,
-        "scoring_method": "comprehensive",
         "tier_boundaries": tier_boundaries
     }
 
 
 def print_enhanced_tiering(tiering):
-    """Print enhanced tiering results"""
-    print("\n" + "=" * 80)
-    print(f"{'ENHANCED TIERED RANKINGS':^80}")
+    """Print enhanced tiering results with detailed statistics"""
+    print("\n" + "=" * 100)
+    print(f"{'ENHANCED TIERED RANKINGS':^100}")
     print(
-        f"{'Target: 55% efficiency with volume and consistency weighting':^80}"
+        f"{'Target: ' + str(int(tiering['target_efficiency'] * 100)) + '% efficiency with progressive volume scaling':^100}"
     )
     print(
-        f"{'Groups: ' + str(tiering['total_groups']) + ' | Tiers: ' + str(tiering['total_tiers']) + ' (' + get_k_explanation(tiering['total_groups']) + ')':^80}"
+        f"{'Groups: ' + str(tiering['total_groups']) + ' | Tiers: ' + str(tiering['total_tiers']):^100}"
     )
-    print("=" * 80)
+    print("=" * 100)
 
     unique_tiers = sorted(
         set(group['tier'] for group in tiering['tiered_groups']))
@@ -314,29 +421,38 @@ def print_enhanced_tiering(tiering):
         ]
         tier_stats = tiering['tier_stats'][tier]
 
-        print(f"\n{f'TIER {tier}':=^80}")
+        print(f"\n{f'TIER {tier}':=^100}")
         print(f"Groups: {tier_stats['groups']} | "
               f"Avg Score: {tier_stats['avg_score']:.1f} | "
               f"Avg Efficiency: {tier_stats['avg_efficiency']}% | "
+              f"Avg StdDev: {tier_stats['avg_std_dev']:.3f} | "
               f"Total Releases: {tier_stats['total_releases']}")
-        print("-" * 80)
+        print("-" * 100)
 
         # Column headers
         print(
-            f"{'Group':<30} {'Score':>10} {'Efficiency':>10} {'Releases':>10}")
-        print("-" * 80)
+            f"{'Group':<25} {'Score':>8} {'Efficiency':>10} {'Delta%':>8} {'StdDev':>8} {'Releases':>8}"
+        )
+        print("-" * 100)
 
         # Sort groups within tier by score
         for group in sorted(tier_groups,
                             key=lambda x: x['score'],
                             reverse=True):
-            print(f"{group['name']:<30} "
-                  f"{group['score']:>9.1f} "
-                  f"{group['efficiency']:>9}% "
-                  f"{group['releases']:>10}")
+            print(
+                f"{group['name']:<25} "
+                f"{group['score']:>8.1f} "
+                f"{group['efficiency']:>9}% "
+                f"{abs(group['efficiency'] - (tiering['target_efficiency'] * 100)):>8.1f} "  # Fixed delta calculation
+                f"{group['std_dev']:>8.3f} "
+                f"{group['releases']:>8}")
 
 
 def main():
+    # Parse command line arguments
+    args = parse_args()
+    target_efficiency = args.target
+
     input_path = Path('input')
     if not input_path.exists():
         print("Input directory not found")
@@ -375,7 +491,8 @@ def main():
     # Process and analyze releases
     results = analyze_releases(all_releases)
     analysis = analyze_results(results)
-    enhanced_tiering = analyze_tiers_enhanced(results)
+    enhanced_tiering = analyze_tiers_enhanced(
+        results, target_efficiency=target_efficiency)
 
     # Save results
     with open('results.json', 'w') as f:
@@ -390,14 +507,11 @@ def main():
             "total_movies_processed": movies_processed,
             "movies_with_2160p": movies_with_2160p,
             "target_efficiency": enhanced_tiering["target_efficiency"],
-            "total_tiers": enhanced_tiering["total_tiers"],
-            "scoring_method": enhanced_tiering["scoring_method"]
+            "total_tiers": enhanced_tiering["total_tiers"]
         },
         "tier_statistics": enhanced_tiering["tier_stats"],
         "tiered_groups": enhanced_tiering["tiered_groups"],
-        "scoring_details": {
-            "tier_boundaries": enhanced_tiering["tier_boundaries"]
-        }
+        "tier_boundaries": enhanced_tiering["tier_boundaries"]
     }
 
     with open('tiers.json', 'w') as f:
