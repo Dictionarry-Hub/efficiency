@@ -11,7 +11,12 @@ remux_pattern = re.compile(r'remux', re.IGNORECASE)
 uhd_pattern = re.compile(r'2160p', re.IGNORECASE)
 
 # Release group mapping dictionary - keys should be lowercase
-GROUP_MAPPINGS = {'beyondhd': 'W4NK3R', 'b0mbardiers': 'b0mbardiers'}
+GROUP_MAPPINGS = {
+    'beyondhd': 'W4NK3R',
+    'b0mbardiers': 'b0mbardiers',
+    'terminal': 'TERMiNAL',
+    '10bit-hds': "HDS"
+}
 
 
 def normalize_group_name(name):
@@ -163,39 +168,38 @@ def get_k_explanation(total_groups):
         return f">50 groups → 6 tiers"
 
 
-def calculate_group_score(group_data, target_efficiency=0.60):
+def calculate_group_score(group_data, target_efficiency=0.55):
     """
     Calculate a comprehensive score for a release group based on:
-    - Proximity to target efficiency
-    - Number of releases (volume)
-    - Consistency of releases
+    - Proximity to target efficiency (primary factor)
+    - Release consistency/jitter (secondary factor)
+    - Number of releases (minor factor, capped at 5)
     """
     efficiency = group_data["average_compression_ratio"]
     releases = len(group_data["releases"])
+    ratios = [r["compression_ratio"] for r in group_data["releases"]]
 
-    # Calculate standard deviation of compression ratios
-    if releases > 1:
-        ratios = [r["compression_ratio"] for r in group_data["releases"]]
-        std_dev = statistics.stdev(ratios)
-    else:
-        std_dev = 0.1  # Default value for single release
-
-    # Base score (0-100) based on proximity to target
+    # Calculate efficiency score (0-100)
     efficiency_delta = abs(efficiency - target_efficiency)
     base_score = max(0, 100 - (efficiency_delta * 100))
 
-    # Volume multiplier (logarithmic scale with reduced impact)
-    # 1.0 for 1 release, ~1.15 for 10 releases, ~1.3 for 100 releases
-    volume_multiplier = 1 + (math.log10(releases + 1) / 10)
+    # Calculate jitter penalty if multiple releases
+    if len(ratios) > 1:
+        ratio_range = max(ratios) - min(ratios)
+        # More reasonable jitter penalty (10 points per 10% spread)
+        jitter_penalty = (ratio_range * 100) / 10
+    else:
+        jitter_penalty = 0
 
-    # Consistency multiplier (penalize high standard deviation)
-    # 1.0 for perfect consistency, decreasing as std_dev increases
-    consistency_multiplier = 1 / (1 + std_dev)
+    # Small volume bonus (capped at 5 releases)
+    volume_bonus = min(releases,
+                       5) * 2  # +2 points per release up to 5 releases
 
     # Calculate final score
-    final_score = base_score * volume_multiplier * consistency_multiplier
+    final_score = base_score + volume_bonus - jitter_penalty
 
-    return round(final_score, 2)
+    # Ensure score stays within 0-100 range
+    return round(max(0, min(100, final_score)), 2)
 
 
 def analyze_tiers_enhanced(results, target_efficiency=0.60):
@@ -294,7 +298,7 @@ def print_enhanced_tiering(tiering):
     print("\n" + "=" * 80)
     print(f"{'ENHANCED TIERED RANKINGS':^80}")
     print(
-        f"{'Target: 60% efficiency with volume and consistency weighting':^80}"
+        f"{'Target: 55% efficiency with volume and consistency weighting':^80}"
     )
     print(
         f"{'Groups: ' + str(tiering['total_groups']) + ' | Tiers: ' + str(tiering['total_tiers']) + ' (' + get_k_explanation(tiering['total_groups']) + ')':^80}"
