@@ -29,6 +29,7 @@ GROUP_MAPPINGS = {
     'beyondhd': 'W4NK3R',
     'b0mbardiers': 'b0mbardiers',
     'terminal': 'TERMiNAL',
+    'whiterhino': 'whiterhino',
     '10bit-hds': "HDS"
 }
 
