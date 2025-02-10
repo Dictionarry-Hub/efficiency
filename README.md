@@ -1,4 +1,4 @@
-# Release Efficiency Analyzer
+# Release Efficiency Analyzer Test
 
 Analyzes and ranks release groups based on their encoding efficiency.
 
